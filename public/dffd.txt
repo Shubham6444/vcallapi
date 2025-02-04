@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zoom Clone</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+
+        #app {
+            display: flex;
+            height: 100vh;
+        }
+
+        #sidebar {
+            width: 250px;
+            background: #f0f0f0;
+            padding: 20px;
+        }
+
+        #main {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #video-grid {
+            display: flex;
+            flex-wrap: wrap;
+            flex-grow: 1;
+        }
+
+        .video-container {
+            position: relative;
+            width: 300px;
+            height: 225px;
+            margin: 5px;
+        }
+
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        #controls {
+            padding: 10px;
+            background: #333;
+            display: flex;
+            justify-content: center;
+        }
+
+        button {
+            margin: 0 5px;
+            padding: 10px;
+            cursor: pointer;
+        }
+
+        #chat {
+            height: 200px;
+            overflow-y: auto;
+            border-top: 1px solid #ccc;
+            padding: 10px;
+        }
+
+        #chat-input {
+            width: calc(100% - 20px);
+            padding: 10px;
+            margin-top: 10px;
+        }
+    </style>
+    <script src="/socket.io/socket.io.js"></script>
+</head>
+
+<body>
+    <div id="app">
+        <div id="sidebar">
+            <h2>Zoom Clone</h2>
+            <div id="room-controls">
+                <input type="text" id="room-input" placeholder="Enter room name">
+                <button onclick="joinRoom()">Join/Create Room</button>
+            </div>
+            <h3>Participants</h3>
+            <ul id="participants-list"></ul>
+        </div>
+        <div id="main">
+            <div id="video-grid"></div>
+            <div id="controls">
+                <button onclick="toggleAudio()">Mute/Unmute</button>
+                <button onclick="toggleVideo()">Start/Stop Video</button>
+                <button onclick="startScreenShare()">Share Screen</button>
+            </div>
+            <div id="chat"></div>
+            <input type="text" id="chat-input" placeholder="Type a message..." onkeypress="sendMessage(event)">
+        </div>
+    </div>
+    <script>
+        const socket = io();
+        let localStream;
+        let screenStream;
+        let peerConnections = {};
+        let room = null;
+        const config = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+        const videoGrid = document.getElementById('video-grid');
+        const participantsList = document.getElementById('participants-list');
+        const chatDiv = document.getElementById('chat');
+        const chatInput = document.getElementById('chat-input');
+
+        async function joinRoom() {
+            const roomName = document.getElementById('room-input').value;
+            if (roomName) {
+                room = roomName;
+                await setupLocalStream();
+                socket.emit('join-room', room);
+            }
+        }
+
+        async function setupLocalStream() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                addVideoStream(localStream, 'You');
+            } catch (err) {
+                console.error('Error accessing media devices.', err);
+            }
+        }
+
+        function addVideoStream(stream, userId) {
+            const existingVideoContainer = document.querySelector(`.video-container[data-user-id="${userId}"]`);
+            if (existingVideoContainer) {
+                existingVideoContainer.remove();
+            }
+
+            const videoContainer = document.createElement('div');
+            videoContainer.className = 'video-container';
+            videoContainer.setAttribute('data-user-id', userId);
+            const video = document.createElement('video');
+            video.srcObject = stream;
+            video.autoplay = true;
+            video.playsinline = true;
+            if (userId === 'You') video.muted = true;
+            videoContainer.appendChild(video);
+            const label = document.createElement('div');
+            label.textContent = userId;
+            label.style.position = 'absolute';
+            label.style.bottom = '10px';
+            label.style.left = '10px';
+            label.style.color = 'white';
+            label.style.backgroundColor = 'rgba(0,0,0,0.5)';
+            label.style.padding = '5px';
+            videoContainer.appendChild(label);
+            videoGrid.appendChild(videoContainer);
+        }
+
+        socket.on('user-connected', userId => {
+            console.log('User  connected:', userId);
+            const pc = new RTCPeerConnection(config);
+            peerConnections[userId] = pc;
+
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+            pc.onicecandidate = event => {
+                if (event.candidate) {
+                    socket.emit('ice-candidate', { userId, candidate: event.candidate });
+                }
+            };
+
+            pc.ontrack = event => {
+                addVideoStream(event.streams[0], userId);
+            };
+
+            pc.createOffer()
+                .then(offer => pc.setLocalDescription(offer))
+                .then(() => {
+                    socket.emit('offer', { userId, offer: pc.localDescription });
+                });
+
+            const li = document.createElement('li');
+            li.textContent = userId;
+            li.id = `participant-${userId}`;
+            participantsList.appendChild(li);
+        });
+
+        socket.on('user-disconnected', userId => {
+            console.log('User  disconnected:', userId);
+            if (peerConnections[userId]) {
+                peerConnections[userId].close();
+                delete peerConnections[userId];
+            }
+            const videoElement = document.querySelector(`.video-container[data-user-id="${userId}"]`);
+            if (videoElement) {
+                videoElement.remove();
+            }
+            const participantElement = document.getElementById(`participant-${userId}`);
+            if (participantElement) {
+                participantElement.remove();
+            }
+        });
+
+        socket.on('offer', async ({ userId, offer }) => {
+            const pc = new RTCPeerConnection(config);
+            peerConnections[userId] = pc;
+
+            pc.onicecandidate = event => {
+                if (event.candidate) {
+                    socket.emit('ice-candidate', { userId, candidate: event.candidate });
+                }
+            };
+
+            pc.ontrack = event => {
+                addVideoStream(event.streams[0], userId);
+            };
+
+            await pc.setRemoteDescription(new RTCSessionDescription(offer));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit('answer', { userId, answer: pc.localDescription });
+        });
+
+        socket.on('answer', ({ userId, answer }) => {
+            peerConnections[userId].setRemoteDescription(new RTCSessionDescription(answer));
+        });
+
+        socket.on('ice-candidate', ({ userId, candidate }) => {
+            peerConnections[userId].addIceCandidate(new RTCIceCandidate(candidate));
+        });
+
+        socket.on('chat-message', ({ sender, message }) => {
+            addMessageToChat(sender, message);
+        });
+
+        async function startScreenShare() {
+            try {
+                screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+                const videoTrack = screenStream.getVideoTracks()[0];
+
+                Object.values(peerConnections).forEach(pc => {
+                    const sender = pc.getSenders().find(s => s.track.kind === 'video');
+                    if (sender) {
+                        sender.replaceTrack(videoTrack);
+                    }
+                });
+
+                addVideoStream(screenStream, 'Your Screen');
+                videoTrack.onended = stopScreenShare;
+            } catch (err) {
+                console.error('Error sharing screen', err);
+            }
+        }
+
+        function stopScreenShare() {
+            if (screenStream) {
+                screenStream.getTracks().forEach(track => track.stop());
+                const videoTrack = localStream.getVideoTracks()[0];
+
+                Object.values(peerConnections).forEach(pc => {
+                    const sender = pc.getSenders().find(s => s.track.kind === 'video');
+                    if (sender) {
+                        sender.replaceTrack(videoTrack);
+                    }
+                });
+            }
+        }
+
+        function toggleAudio() {
+            if (localStream) {
+                const audioTrack = localStream.getAudioTracks()[0];
+                audioTrack.enabled = !audioTrack.enabled; // Toggle audio track
+            }
+        }
+
+        function toggleVideo() {
+            if (localStream) {
+                const videoTrack = localStream.getVideoTracks()[0];
+                videoTrack.enabled = !videoTrack.enabled; // Toggle video track
+            }
+        }
+
+        function addMessageToChat(sender, message) {
+            const messageElement = document.createElement('div');
+            messageElement.textContent = `${sender}: ${message}`;
+            chatDiv.appendChild(messageElement);
+            chatDiv.scrollTop = chatDiv.scrollHeight;
+        }
+
+        function sendMessage(event) {
+            if (event.key === 'Enter') {
+                const message = chatInput.value;
+                socket.emit('chat-message', { room, message });
+                addMessageToChat('You', message);
+                chatInput.value = '';
+            }
+        }
+    </script>
+</body>
+
+</html>
+
+import express from "express"
+import { createServer } from "http"
+import { Server } from "socket.io"
+import path from "path"
+import { fileURLToPath } from "url"
+
+const app = express()
+const server = createServer(app)
+const io = new Server(server)
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+// Serve static files
+app.use(express.static(path.join(__dirname, "public")))
+
+app.get("/", (req, res) => {
+    res.sendFile(path.join(__dirname, "public", "index.html"))
+})
+app.get("/1", (req, res) => {
+    res.sendFile(path.join(__dirname, "public", "demo.html"))
+})
+
+const rooms = new Map()
+
+io.on("connection", (socket) => {
+    console.log(`User connected: ${socket.id}`)
+    socket.on("join-room", (roomName) => {
+        socket.join(roomName)
+        if (!rooms.has(roomName)) {
+            rooms.set(roomName, new Set())
+        }
+        rooms.get(roomName).add(socket.id)
+        socket.to(roomName).emit("user-connected", socket.id)
+
+        // Send list of existing participants to the new user
+        const participants = Array.from(rooms.get(roomName))
+        socket.emit("existing-participants", participants)
+    })
+
+    socket.on("offer", ({ userId, offer }) => {
+        socket.to(userId).emit("offer", { userId: socket.id, offer })
+    })
+
+    socket.on("answer", ({ userId, answer }) => {
+        socket.to(userId).emit("answer", { userId: socket.id, answer })
+    })
+
+    socket.on("ice-candidate", ({ userId, candidate }) => {
+        socket.to(userId).emit("ice-candidate", { userId: socket.id, candidate })
+    })
+
+    socket.on("chat-message", ({ room, message }) => {
+        socket.to(room).emit("chat-message", { sender: socket.id, message })
+    })
+
+    socket.on("disconnecting", () => {
+        for (const room of socket.rooms) {
+            if (rooms.has(room)) {
+                rooms.get(room).delete(socket.id)
+                if (rooms.get(room).size === 0) {
+                    rooms.delete(room)
+                }
+                socket.to(room).emit("user-disconnected", socket.id)
+            }
+        }
+    })
+
+    socket.on("disconnect", () => {
+        console.log(`User disconnected: ${socket.id}`)
+    })
+})
+
+const PORT = process.env.PORT || 9000
+server.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`)
+})
